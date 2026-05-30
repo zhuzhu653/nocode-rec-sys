@@ -31,10 +31,17 @@ class DiceActivation(nn.Module):
         self.alpha = nn.Parameter(torch.zeros(emb_size))
 
     def forward(self, x):
-        # x: [B, emb_size]
+        # x: [B, emb_size] or [B, T, emb_size]
+        orig_shape = x.shape
+        if x.dim() == 3:
+            B, T, D = x.shape
+            x = x.reshape(B * T, D)
         x_normed = self.bn(x)
         p = torch.sigmoid(x_normed)
-        return p * x + (1 - p) * self.alpha * x
+        out = p * x + (1 - p) * self.alpha * x
+        if len(orig_shape) == 3:
+            out = out.reshape(orig_shape)
+        return out
 
 
 class AttentionUnit(nn.Module):

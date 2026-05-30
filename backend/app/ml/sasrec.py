@@ -126,13 +126,12 @@ class SASRec(nn.Module):
         x = self.item_emb(item_seq) + self.pos_emb(positions)
         x = self.emb_dropout(x)
 
-        # Causal mask
+        # Causal mask only (不用 key_padding_mask 避免全 mask 导致 NaN)
         causal_mask = self._causal_mask(T, device)
-        key_padding_mask = (item_seq == 0)  # padding positions
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
+            x = block(x, attn_mask=causal_mask, key_padding_mask=None)
 
         x = self.final_norm(x)
 

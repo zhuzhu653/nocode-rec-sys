@@ -1,0 +1,24 @@
+{
+  "config": {
+    "data": "movielens",
+    "epochs": 30,
+    "batch_size": 256,
+    "lr": 0.001,
+    "device": "cpu",
+    "n_items": 3707,
+    "n_users": 6041
+  },
+  "results": {
+    "SASRec": {
+      "epoch": 30,
+      "loss": 3.322107434272766,
+      "Hit@5": 0.01,
+      "Hit@10": 0.01,
+      "Hit@20": 0.01,
+      "NDCG@5": 0.005,
+      "NDCG@10": 0.005,
+      "NDCG@20": 0.005,
+      "MRR": 0.003333333333333333
+    }
+  }
+}
