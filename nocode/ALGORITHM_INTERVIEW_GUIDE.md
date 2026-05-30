@@ -1338,6 +1338,374 @@ class IncrementalEmbeddingUpdater:
 
 ---
 
+## 16. 面试深度追问与实战经验
+
+> 以下是面试中最常被追问的"第二层/第三层"问题，以及工程实战中的坑和调优经验。
+
+---
+
+### 16.1 双塔模型追问
+
+**Q: 双塔的缺点是什么？怎么改进？**
+
+A: 核心缺点是**User/Item 无法交互** — 两个塔独立编码，内积只能做简单匹配，无法建模细粒度交互（如"用户上次看了某类 item → 对当前 item 的影响"）。
+
+改进：
+1. **精排补上交互**: 双塔只做召回，精排用 DIN/Cross-Encoder 补上交互
+2. **多向量表示**: ComiRec 用多个向量表示用户多兴趣，逐一匹配
+3. **轻量交互**: 加入 gate 或 attention 在 embedding 层做少量交互
+
+**Q: 温度系数 τ 怎么选？**
+
+```python
+loss = F.cross_entropy(logits / temperature, labels)
+```
+
+- τ = 0.05~0.1: 常用范围。太小 → 梯度爆炸/过度自信; 太大 → loss 平坦/难收敛
+- 经验: 先用 0.07 开始，观察 loss 曲线，如果 loss 很快趋于 0 → τ 太大，如果 NaN → τ 太小
+- 可学习温度: `self.temperature = nn.Parameter(torch.tensor(0.07))` (CLIP 做法)
+
+**Q: In-batch Negatives 有什么问题？**
+
+同一 batch 内的其他正样本作为负样本：
+- **热门 item 被过度采为负样本** → 热门 item embedding 被推远 → 召回率下降
+- 解决: 加 log(popularity) 修正 (Sampling Bias Correction)
+- 公式: `corrected_logit = logit - log(p(item_j))`
+
+**Q: 双塔上线后怎么监控退化？**
+
+- Item 塔每天/每周全量更新 embedding + rebuild FAISS 索引
+- User 塔可以实时增量 (只需要 forward, 不需要更新参数)
+- 监控: 新 embedding 和旧 embedding 的 cosine shift > 阈值 → 触发告警
+- 召回率日监控: 抽样用户做 recall@100, 低于阈值则回滚
+
+---
+
+### 16.2 DIN/序列模型追问
+
+**Q: DIN 的 Attention 和 Transformer 的 Attention 有什么区别？**
+
+| 维度 | DIN Attention | Transformer Attention |
+|------|--------------|----------------------|
+| Query 来源 | target item (外部给定) | 序列自身 (self) |
+| Key/Value | 用户历史序列 | 同样的序列 |
+| 归一化 | softmax 或 不归一化 | 必须 softmax |
+| 位置编码 | 无 (只关心相关性) | 有 (关心顺序) |
+
+DIN 是 **target-query attention**; SASRec 是 **self-attention**。
+
+**Q: 序列长度很长 (10000+) 怎么办？**
+
+| 方案 | 复杂度 | 精度 | 说明 |
+|------|--------|------|------|
+| 截断最近 N | O(N²) | 损失远期 | 最简单 |
+| SIM (Search-based) | O(L×K) | 高 | 先检索 top-K 相关历史 |
+| ETA (Hash-based) | O(L) | 中 | LSH 近似 |
+| SDIM (Meituan) | O(1) | 中 | Hash + 多签名 |
+| HSTU (Meta) | O(L) | 高 | Pointwise cumsum |
+
+工业级经验:
+- 短序列 (<50): 直接 DIN/SASRec
+- 中序列 (50-500): BST/DIEN
+- 长序列 (500-10000): SIM (两阶段: GSU 检索 + ESU 精排)
+- 超长序列 (10000+): HSTU/SDIM
+
+**Q: BPR Loss vs BCE Loss vs InfoNCE，什么时候用什么？**
+
+```python
+# BPR: 正负样本对比, 排序损失
+loss_bpr = -log(sigmoid(pos_score - neg_score))
+
+# BCE: 独立二分类
+loss_bce = -y*log(sigmoid(score)) - (1-y)*log(1-sigmoid(score))
+
+# InfoNCE: 对比学习, batch 内多负样本
+loss_nce = -log(exp(pos/τ) / Σ exp(neg_i/τ))
+```
+
+| Loss | 适用 | 负样本数 | 梯度信号 |
+|------|------|---------|---------|
+| BPR | 召回/序列 | 1 | 弱 (只比较一对) |
+| BCE | 精排 (CTR) | 0 (二分类) | 强 (每条样本一个信号) |
+| InfoNCE | 召回/对比学习 | batch_size-1 | 最强 (batch内多负样本) |
+
+---
+
+### 16.3 特征工程追问
+
+**Q: 如何处理特征穿越 (data leakage)？**
+
+"未来"信息泄漏到训练中:
+- 错误: 用 item 全生命周期 CTR 作为训练特征 → 新 item CTR=0 线上不准
+- 正确: Point-in-Time Join, 训练时只用"到那一刻为止"的统计值
+- 工具: 特征快照表 (每天打一版 feature snapshot)
+
+**Q: 连续特征怎么离散化？embedding 怎么做？**
+
+```python
+# 方法 1: 等频分桶
+age_bucket = pd.qcut(age, q=10, labels=False)  # 10桶
+
+# 方法 2: 对数变换 + 分桶
+price_log = int(math.log(price + 1) * 10)
+
+# 方法 3: AutoDis (可学习离散化, Huawei 2021)
+class AutoDis(nn.Module):
+    def __init__(self, n_buckets=20, embed_dim=16):
+        self.meta_emb = nn.Parameter(torch.randn(n_buckets, embed_dim))
+        self.proj = nn.Linear(1, n_buckets)
+    def forward(self, x):  # x: [B, 1]
+        weights = F.softmax(self.proj(x), dim=-1)  # [B, n_buckets]
+        return (weights.unsqueeze(-1) * self.meta_emb).sum(1)  # [B, d]
+```
+
+**Q: 实时特征和离线特征不一致（Train-Serve Skew）怎么办？**
+
+根因: 训练时用 T+1 离线计算的特征, serving 时用实时计算的 → 分布不同。
+
+解决方案 (按优先级):
+1. **Feature Logging** (最推荐): serving 时将实时特征 log 下来, 训练直接用 logged 特征
+2. **统一计算**: 训练和 serving 用同一份代码/同一个 feature store
+3. **补偿**: 训练时加入高斯噪声模拟实时特征的波动
+
+---
+
+### 16.4 负采样追问
+
+**Q: Hard Negative 会有 False Negative 问题，怎么解决？**
+
+```
+场景: 用户 A 对 item X 语义相近但恰好没交互 → 被当做 hard negative
+     → 模型学到"推远 X" → 实际上 A 对 X 是感兴趣的
+```
+
+解决:
+1. **混合采样**: Easy:Hard = 7:3, 不要全用 hard negative
+2. **Margin 过滤**: 只用 similarity 在 (0.5, 0.8) 之间的作为 hard negative, 太高的可能是 false negative
+3. **定期刷新**: 随着模型更新, 之前的 hard negative 可能变成 positive → 定期重新采
+4. **Debiased InfoNCE**: 加入 popularity 修正
+
+**Q: 负样本比例（neg:pos）怎么选？**
+
+- 召回模型: 通常 1:4 到 1:10 (InfoNCE batch 内自然形成)
+- 精排模型 (CTR): 通常 1:1 到 1:3 (线上曝光未点击作为负样本, 天然比例)
+- 图模型 (BPR): 通常 1:1 (每个正样本配一个 uniform negative)
+
+经验:
+- 负样本太少 → 模型学不到"什么是不好的"
+- 负样本太多 → 正样本信号被稀释, 训练不稳定
+- InfoNCE 的"大 batch = 多负样本" 天然利好 → 大 batch 效果好
+
+---
+
+### 16.5 多目标学习追问
+
+**Q: 任务之间的 loss 权重怎么调？**
+
+```python
+# 方法 1: 手动调 (最常用)
+total_loss = w1 * loss_ctr + w2 * loss_cvr + w3 * loss_stay
+# w1=1.0, w2=1.0, w3=0.5 (根据业务重要性)
+
+# 方法 2: Uncertainty Weighting (Kendall 2018)
+# 每个任务学一个 log(σ²), 不确定性大的 loss 权重小
+loss = Σ (1/(2σ_i²)) * loss_i + log(σ_i)
+
+# 方法 3: GradNorm (Chen 2018)
+# 动态平衡各任务梯度大小
+# 如果某个任务训练太快 → 降低其权重
+
+# 方法 4: Pareto (Multi-Objective Optimization)
+# 找到 Pareto 最优解集合
+```
+
+**Q: MMOE 的 gate 真的能学到有意义的路由吗？**
+
+实验观察:
+- 在任务高度相关时 (如 CTR 和 点赞率), gate 权重很相似 → 共享专家
+- 在任务冲突时 (如 时长 vs 多样性), gate 权重差异大 → 各走各的专家
+- 可视化: 导出 gate softmax 权重, 看不同任务对同一 expert 的偏好
+
+**注意**: 如果任务太简单/数据太少, gate 可能退化为"均匀分配" → 等价于 Shared-Bottom。
+
+**Q: PLE 比 MMOE 好多少？什么时候值得用 PLE？**
+
+- 当任务确实冲突（加一个任务, 另一个跌了）→ 用 PLE
+- 如果所有任务正相关 → MMOE 就够了 (PLE 增加 50%+ 参数)
+- PLE 核心: 独占专家保证"至少有一个 expert 只服务我这个 task"
+
+---
+
+### 16.6 广告系统追问
+
+**Q: eCPM 排序真的能同时满足平台和广告主吗？**
+
+```
+平台收入 = Σ actual_cost_i (所有展示广告的扣费)
+广告主 ROI = conversions / cost
+
+eCPM 排序 = pCTR × pCVR × Bid → 排在前面的是"愿意出价高 且 预估效果好的"
+→ 平台收入 ∝ eCPM → 高 eCPM 展示 → 收入最大化
+→ 广告主: 预估准 → actual CPA ≈ target CPA → ROI 满足
+
+关键: pCTR/pCVR 的准确性决定了平衡是否成立
+如果预估偏高 → 广告主多花钱/ROI 差 → 退出 → 长期收入下降
+如果预估偏低 → 不展示 → 短期收入下降
+```
+
+**Q: GSP 和 VCG 的区别？为什么用 GSP？**
+
+| 机制 | 定价 | 激励兼容 | 收入 |
+|------|------|---------|------|
+| First Price | 按出价付 | ❌ (鼓励压价) | 高但不稳定 |
+| GSP | 按第二名定价 | 近似 (均衡时) | 中 |
+| VCG | 按社会成本定价 | ✅ (理论最优) | 低 |
+
+为什么用 GSP 而非 VCG:
+- VCG 理论完美但收入更低 (Google 验证过)
+- GSP 在 Nash 均衡时近似激励兼容
+- 实现更简单 (VCG 需要计算"没有你时的社会福利")
+- 业界共识: Google/Meta/Alibaba 都用 GSP 或修改版
+
+**Q: PID 控制器的 Kp/Ki/Kd 怎么调？**
+
+```
+实战经验:
+  Kp = 0.3~0.8  (比例: 反应速度)
+  Ki = 0.05~0.2 (积分: 消除稳态误差, 太大会振荡)
+  Kd = 0.01~0.1 (微分: 抑制超调, 太大会放大噪声)
+
+调参方法:
+  1. 先只用 P (Ki=Kd=0), 调到不振荡
+  2. 加 I, 消除稳态误差
+  3. 如果振荡, 加 D 抑制
+  4. 或者直接用 Ziegler-Nichols 方法自动整定
+```
+
+---
+
+### 16.7 因果推断追问
+
+**Q: A/B 测试不就是因果推断吗？为什么还需要 Uplift Model？**
+
+```
+A/B 测试: 估计 ATE (平均处理效应) → "整体上策略有效吗?"
+Uplift:   估计 CATE (条件处理效应) → "对谁有效? 对谁没效果?"
+
+A/B 测试告诉你: 发券整体提升 2% 转化率
+Uplift 告诉你: 
+  - 对 30% 用户提升 10% (Persuadables) → 值得发
+  - 对 50% 用户无变化 (Sure Things) → 不发也会买, 白花钱
+  - 对 20% 用户降低 5% (Sleeping Dogs) → 千万别发
+```
+
+**Q: 观察性数据 (non-RCT) 能做因果吗？**
+
+可以, 但假设更强:
+
+| 方法 | 需要的假设 | 适用 |
+|------|-----------|------|
+| RCT (A/B 测试) | 随机分配 | 金标准 |
+| Matching/PSM | 无未观测混淆 | 观测变量够多 |
+| IPW | 倾向性已知/可估 | 需要好的 propensity model |
+| DR | e(x) 或 μ(x) 之一正确 | 更鲁棒 |
+| DID | 平行趋势 | 前后对照 |
+| IV | 排他性 + 相关性 | 有好的工具变量 |
+| RDD | 连续性 | 有明确阈值 |
+
+**Q: Doubly Robust 为什么方差可能比 IPW 还大？**
+
+理论上 DR 更鲁棒, 但实际中:
+- 如果 propensity score 接近 0 或 1 → 1/e(x) 爆炸 → 方差极大
+- 解决: clip propensity (我们代码中 clip 到 [0.05, 0.95])
+- 或用 SNIPS (Self-Normalized IPS): 分子分母都加权, 自动归一化
+
+---
+
+### 16.8 系统设计追问
+
+**Q: 推荐系统的延迟预算怎么分配？**
+
+```
+总延迟预算: 200ms (用户可接受)
+
+分配:
+  召回 (多路并行): 20ms → FAISS/Redis
+  特征组装:        30ms → Redis + 计算
+  粗排:           20ms → 双塔 forward
+  精排:           80ms → DIN/DCN 前向 (batch GPU)
+  重排:           30ms → DPP/MMR
+  网络+序列化:     20ms → gRPC/HTTP
+```
+
+**Q: 如何做模型的灰度发布和回滚？**
+
+```
+1. 分桶灰度:
+   - 10% 用户走新模型, 90% 走旧模型
+   - 观察 CTR/CVR/停留时长等核心指标 3-7 天
+   
+2. 自动回滚:
+   - 设置 SLA 阈值 (如 CTR 降幅 > 2%)
+   - 触发 → 自动切回旧模型 + 告警
+
+3. 模型版本管理:
+   - Model Registry (MLflow/自建)
+   - 每个版本记录: 训练数据范围 + 离线指标 + 在线指标
+```
+
+**Q: 特征维度爆炸 (百亿 ID 特征) 怎么办？**
+
+```
+问题: 用户 ID 10 亿 + Item ID 1 亿 + 交叉特征 → Embedding 表 TB 级
+
+解决:
+1. Feature Hashing: hash(feature) % bucket_size → 冲突可接受 (1-2% 性能损失)
+2. Mixed-dimension: 高频 ID 用大 embed_dim, 低频用小 dim
+3. Embedding Table 切分: TorchRec ParameterSharding → 多卡存储
+4. On-demand Loading: 只加载本 batch 用到的 embedding (HBM 缓存)
+```
+
+---
+
+### 16.9 工程调优经验总结
+
+| 调优项 | 经验值 | 踩坑 |
+|--------|--------|------|
+| Learning Rate | Embedding: 1e-3, MLP: 1e-4, Fine-tune: 1e-5 | Embedding lr 太大 → 不稳定 |
+| Batch Size | 召回: 4096+, 精排: 512-2048 | 大 batch 对 InfoNCE 有利 |
+| Embedding Dim | 64 (小数据), 128-256 (大数据) | 太大过拟合, 太小欠拟合 |
+| Dropout | Embedding: 0.1-0.2, MLP: 0.3-0.5 | 序列模型 dropout 加在 attention 后 |
+| Weight Decay | 1e-4 到 1e-6 | Embedding 不加 weight decay |
+| 温度 τ | 0.05-0.1 (InfoNCE) | 太小梯度爆, 太大没区分度 |
+| Sequence Length | 20-50 (精排), 200+ (召回) | 超过有效长度反而有噪声 |
+| 负样本数 | InfoNCE: batch_size-1, BPR: 1-4 | 太多稀释正信号 |
+| 训练 Epoch | 精排: 1-3 epoch (避免过拟合), 召回: 10-30 | 推荐在验证集 early stop |
+| Gradient Clipping | max_norm=1.0 | Transformer 模型必加 |
+
+---
+
+### 16.10 面试常见"陷阱题"
+
+**Q: "你这个项目数据量多大?"**
+
+诚实回答 + 展示扩展方案:
+> "Demo 阶段用合成数据 (1000 users × 50 items) + MovieLens-1M 验证。但架构设计面向百万级: FAISS HNSW 索引支持百万向量毫秒召回, Redis Feature Store 设计支持 QPS 1000+, 模型支持分布式训练 (TorchRec 方案已设计)。"
+
+**Q: "线上效果怎么样?"**
+
+> "离线评估: NDCG@10=0.22, Hit@10=0.35, 多样性 ILS=0.38。A/B 测试框架已搭建, 可以量化策略效果。由于是个人项目, 没有真实线上流量, 但合成数据模拟了工业真实分布 (power-law + position bias + conversion funnel)。"
+
+**Q: "为什么不直接用 RecBole/推荐库?"**
+
+> "目的是展示对算法原理的深度理解和工程落地能力。从零实现每个模块, 知道每一行代码在做什么。比如 DIN 的 attention 为什么用 4 维拼接而不是 dot product (因为需要非对称匹配); HSTU 的 cumsum 为什么能替代 softmax attention (因果性 + O(n) 复杂度)。"
+
+**Q: "你觉得这个系统最大的技术挑战是什么?"**
+
+> "特征一致性 (train-serve skew) 和 多目标之间的权衡。前者通过 Feature Logging 解决; 后者通过 MMOE + PLE + 动态 loss 权重调整, 但实际上到了线上还需要看业务指标 tradeoff (比如 CVR 涨但时长跌, 需要产品决策)。"
+
+---
+
 > **文档维护者**: AI Assistant  
 > **最后更新**: 2026-05-31  
 > **关联代码**: `backend/app/ml/` 全部模块
