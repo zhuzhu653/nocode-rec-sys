@@ -11,26 +11,36 @@ import react from '@vitejs/plugin-react';
 
 const CHAT_VARIABLE = process.env.CHAT_VARIABLE || '';
 const PUBLIC_PATH = process.env.PUBLIC_PATH || '';
+const GITHUB_PAGES = process.env.GITHUB_PAGES === 'true';
 
 const isProdEnv = process.env.NODE_ENV === 'production';
-const publicPath = (isProdEnv && CHAT_VARIABLE)
-  ? PUBLIC_PATH + '/' + CHAT_VARIABLE
-  : PUBLIC_PATH + '/';
-const outDir = (isProdEnv && CHAT_VARIABLE) ? 'build/' + CHAT_VARIABLE : 'build';
+const publicPath = GITHUB_PAGES
+  ? '/nocode-rec-sys/'
+  : (isProdEnv && CHAT_VARIABLE)
+    ? PUBLIC_PATH + '/' + CHAT_VARIABLE
+    : PUBLIC_PATH + '/';
+const outDir = GITHUB_PAGES
+  ? 'dist'
+  : (isProdEnv && CHAT_VARIABLE) ? 'build/' + CHAT_VARIABLE : 'build';
 
 async function loadPlugins() {
-  const plugins = isProdEnv
-  ? CHAT_VARIABLE
-    ? [react(), prodHtmlTransformer(CHAT_VARIABLE)]
-    : [react()]
-  : [
-      devLogger({
-        dirname: resolve(tmpdir(), '.nocode-dev-logs'),
-        maxFiles: '3d',
-      }),
-      react(),
-      devHtmlTransformer(CHAT_VARIABLE),
-    ];
+  const plugins = [react()];
+  
+  if (!GITHUB_PAGES) {
+    try {
+      if (isProdEnv && CHAT_VARIABLE) {
+        plugins.push(prodHtmlTransformer(CHAT_VARIABLE));
+      } else if (!isProdEnv) {
+        plugins.unshift(devLogger({
+          dirname: resolve(tmpdir(), '.nocode-dev-logs'),
+          maxFiles: '3d',
+        }));
+        plugins.push(devHtmlTransformer(CHAT_VARIABLE));
+      }
+    } catch (e) {
+      // nocode plugins not available (e.g. GitHub Actions)
+    }
+  }
 
   if (process.env.NOCODE_COMPILER_PATH) {
     const { componentCompiler } = await import(process.env.NOCODE_COMPILER_PATH);
